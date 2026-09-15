@@ -1,5 +1,3 @@
-_WAITING_WEIGHT=0
-_HOLD_SCALE=1
 """
 Amazon Robotics Hackathon - Routing API
 
@@ -19,6 +17,13 @@ import time
 from functools import lru_cache
 from typing import Optional
 from ar_hackathon.models.graph_state import GraphState
+from ar_hackathon.models.pod import Pod
+
+_FORECAST_CONF = 1.0
+_FORECAST_PRIOR = 1.0
+_FORECAST_MIN_HISTORY = 1
+_FORECAST_FIXED_INTERVAL = 4
+_FORECAST_DEST_MODE = "nearest"
 
 
 _INF = float("inf")
@@ -402,10 +407,6 @@ def drive_unit_next_move(drive_unit_id: int, state: GraphState) -> Optional[int]
         # A deliberate wait invalidates remaining actions from a joint plan.
         _planner.joint_actions = {}
         return None
-    staging, action = _bootstrap_staging(unit, state, _planner)
-    if staging:
-        _planner.joint_actions = {}
-        return action
     return _choose_move(unit, state, _planner, baseline)
 
 
@@ -550,7 +551,11 @@ def _finish_tick(state, first_id, first_action, planner):
         target = getattr(planner, 'rollout_targets', {}).get(unit.id)
         if target is not None and unit.id != first_id:
             if unit.current_node == target:
-                del planner.rollout_targets[unit.id]
+                wait_until = getattr(planner, 'rollout_wait_until', {}).get(unit.id, -1)
+                if state.current_time_step < wait_until and not unit.carrying:
+                    action = None
+                else:
+                    del planner.rollout_targets[unit.id]
             else:
                 edges, nodes = planner.occupancy(state)
                 action = planner.route(unit, target, edges, nodes)
@@ -569,11 +574,74 @@ def _finish_tick(state, first_id, first_action, planner):
     state.current_time_step += 1
 
 
+def _forecast_arrivals(state, planner, horizon):
+    """Construct uncertain next batches solely from previously seen arrivals."""
+    pending = []
+    now = state.current_time_step
+    existing = {pod.id for pod in state.active_pods}
+    for source, history in planner.arrival_history.items():
+        times = sorted(history)
+        if len(times) < _FORECAST_MIN_HISTORY:
+            continue
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        destinations = history[times[-1]]
+        if not destinations:
+            continue
+        if gaps:
+            interval = sorted(gaps)[len(gaps) // 2]
+            variation = sum(abs(gap - interval) for gap in gaps) / max(1, sum(gaps))
+            confidence = _FORECAST_CONF * max(0.1, 1.0 - variation)
+        else:
+            distances = [planner.distance(source, dest) + planner.distance(dest, source)
+                         for dest in destinations]
+            finite = [distance for distance in distances if distance < _INF]
+            if not finite:
+                continue
+            interval = max(1, round(_FORECAST_PRIOR * sum(finite) / len(finite)))
+            confidence = _FORECAST_CONF * 0.5
+        if _FORECAST_FIXED_INTERVAL:
+            nearest = min((planner.distance(source, node.id) for node in state.nodes
+                           if node.node_type == "station"), default=_INF)
+            interval = max(1, round(nearest)) if nearest < _INF else interval
+            confidence = _FORECAST_CONF
+        if _FORECAST_DEST_MODE == "nearest":
+            stations = [node.id for node in state.nodes if node.node_type == "station"]
+            destinations = sorted(stations, key=lambda dest: (planner.distance(source, dest), dest))[:1]
+        elif _FORECAST_DEST_MODE == "global":
+            observed = {dest for epochs in planner.arrival_history.values()
+                        for batch in epochs.values() for dest in batch}
+            destinations = sorted(observed, key=lambda dest: (planner.distance(source, dest), dest))[:1]
+        else:
+            destinations = destinations[:1]
+        if interval <= 0 or now >= times[-1] + 2 * interval:
+            continue
+        arrival = times[-1] + interval
+        if arrival <= now:
+            arrival += interval
+            confidence *= 0.5
+        if arrival > now + horizon:
+            continue
+        for index, dest in enumerate(destinations[:2]):
+            ident = "__forecast_%s_%s_%s" % (source, arrival, index)
+            while ident in existing:
+                ident += "_"
+            existing.add(ident)
+            pending.append((arrival, Pod(ident, source, dest, arrival), confidence))
+    return pending
+
+
 def _rollout(state, unit_id, action, planner, horizon, deadline, target=None, extra_actions=None, capture=None):
     simulation = state.deep_copy()
     simulation.delivered_pods = []
+    future = (_forecast_arrivals(state, planner, horizon)
+              if (not state.get_drive_unit(unit_id).carrying and
+                  planner.nodes[state.get_drive_unit(unit_id).current_node].capacity is None) else [])
+    confidence = {pod.id: weight for _, pod, weight in future}
     policy = _clone_planner(planner)
     policy.rollout_targets = {unit_id: target} if target is not None else {}
+    policy.rollout_wait_until = {unit_id: min(arrival for arrival, pod, _ in future
+                                             if pod.current_node == target)} if (
+        target is not None and any(pod.current_node == target for _, pod, _ in future)) else {}
     policy.forced_time = state.current_time_step
     policy.forced_actions = extra_actions or {}
     policy.recorded_actions = {}
@@ -581,14 +649,18 @@ def _rollout(state, unit_id, action, planner, horizon, deadline, target=None, ex
         if time.perf_counter() >= deadline:
             return None
         if step:
+            for arrival, pod, _ in future:
+                if arrival == simulation.current_time_step:
+                    simulation.active_pods.append(pod)
             _resolve_pods(simulation)
         _finish_tick(simulation, unit_id if step == 0 else None,
                      action if step == 0 else None, policy)
-        if not simulation.active_pods:
+        if not simulation.active_pods and not any(
+                arrival >= simulation.current_time_step for arrival, _, _ in future):
             break
     if capture is not None:
         capture.update(policy.recorded_actions)
-    reward = sum(math.exp(-min(700, (pod.delivery_time - pod.entry_time) / 50.0))
+    reward = sum(confidence.get(pod.id, 1.0) * math.exp(-min(700, (pod.delivery_time - pod.entry_time) / 50.0))
                  for pod in simulation.delivered_pods)
     # Optimistic terminal delivery estimates keep long jobs visible to a short
     # horizon; only pods already known in the supplied state are evaluated.
@@ -609,7 +681,7 @@ def _rollout(state, unit_id, action, planner, horizon, deadline, target=None, ex
             best = min(best, delay)
         if best < _INF:
             duration = max(0, simulation.current_time_step + best - 1 - pod.entry_time)
-            reward += 0.95 * math.exp(-min(700, duration / 50.0))
+            reward += confidence.get(pod.id, 1.0) * 0.95 * math.exp(-min(700, duration / 50.0))
     return reward
 
 
@@ -627,7 +699,7 @@ def _choose_move(unit, state, planner, baseline):
 
 def _search_move(unit, state, planner, baseline):
     pending = getattr(planner, 'joint_actions', {})
-    if getattr(planner, 'joint_time', -1) == state.current_time_step and unit.id in pending:
+    if unit.carrying and getattr(planner, 'joint_time', -1) == state.current_time_step and unit.id in pending:
         position, carrying, action = pending.pop(unit.id)
         if position == unit.current_node and carrying == tuple(unit.carrying):
             edges, nodes = planner.occupancy(state)
@@ -669,6 +741,8 @@ def _search_move(unit, state, planner, baseline):
             targets.add(pod.current_node)
     targets.discard(unit.current_node)
     targets.discard(None)
+    if not unit.carrying:
+        targets.update(pod.current_node for _, pod, _ in _forecast_arrivals(state, planner, horizon))
     for target in sorted(targets, key=lambda node: (planner.distance(unit.current_node, node), node))[:6]:
         action = planner.route(unit, target, edges, nodes)
         score = _rollout(state, unit.id, action, planner, horizon, deadline, target)
@@ -698,59 +772,3 @@ def _search_move(unit, state, planner, baseline):
         planner.joint_time = state.current_time_step
         planner.joint_actions = best_joint
     return best_action
-
-def _bootstrap_staging(unit, state, planner):
-    """Reserve spare dispatch coverage where loaded robots return latest.
-
-    Initial throughput is uncertain; a reservation expires after a bounded
-    physical service interval or immediately when that unit picks up a pod.
-    """
-    if not hasattr(planner, 'bootstrap_targets'):
-        planner.bootstrap_targets = {}
-        if state.current_time_step != 0:
-            return False, None
-        sources = sorted(planner.arrival_history)
-        loaded = [other for other in state.drive_units if other.carrying]
-        empty = [other for other in state.drive_units if not other.carrying and other.capacity > 0]
-        if len(sources) < 2 or not loaded or not empty:
-            return False, None
-        stations = [node.id for node in state.nodes if node.node_type == 'station']
-        pod_map = {pod.id:pod for pod in state.active_pods}
-        assigned = set()
-        for other in empty:
-            position = other.transit_destination if other.in_transit else other.current_node
-            choices = []
-            for source in sources:
-                if source in assigned:
-                    continue
-                own = planner.distance(position, source)
-                nearest = min((planner.distance(source, station) for station in stations), default=_INF)
-                if own == _INF or nearest == _INF:
-                    continue
-                alternatives = []
-                for busy in loaded:
-                    start = busy.transit_destination if busy.in_transit else busy.current_node
-                    carried = [pod_map[p] for p in busy.carrying if p in pod_map]
-                    dest = planner.delivery_target(start, carried, state.current_time_step)
-                    if dest is not None:
-                        remaining = max(0, math.ceil(busy.transit_remaining_time)) if busy.in_transit else 0
-                        alternatives.append(remaining + planner.distance(start, dest) + planner.distance(dest, source))
-                if not alternatives:
-                    continue
-                waiting = sum(p.carried_by is None and p.current_node == source for p in state.active_pods)
-                metric = min(alternatives) - own + _WAITING_WEIGHT * waiting
-                choices.append((metric, -own, source, nearest))
-            if choices:
-                _, _, source, nearest = max(choices)
-                assigned.add(source)
-                planner.bootstrap_targets[other.id] = (source, min(16, max(2, math.ceil(nearest * _HOLD_SCALE))))
-    item = planner.bootstrap_targets.get(unit.id)
-    if item is None:
-        return False, None
-    source, expires = item
-    if unit.carrying or state.current_time_step >= expires:
-        del planner.bootstrap_targets[unit.id]
-        return False, None
-    edge_release, node_release = planner.occupancy(state)
-    return True, planner.route(unit, source, edge_release, node_release)
-
