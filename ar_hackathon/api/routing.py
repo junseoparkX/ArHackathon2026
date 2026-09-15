@@ -1,3 +1,5 @@
+_WAITING_WEIGHT=0
+_HOLD_SCALE=1
 """
 Amazon Robotics Hackathon - Routing API
 
@@ -400,6 +402,10 @@ def drive_unit_next_move(drive_unit_id: int, state: GraphState) -> Optional[int]
         # A deliberate wait invalidates remaining actions from a joint plan.
         _planner.joint_actions = {}
         return None
+    staging, action = _bootstrap_staging(unit, state, _planner)
+    if staging:
+        _planner.joint_actions = {}
+        return action
     return _choose_move(unit, state, _planner, baseline)
 
 
@@ -692,3 +698,59 @@ def _search_move(unit, state, planner, baseline):
         planner.joint_time = state.current_time_step
         planner.joint_actions = best_joint
     return best_action
+
+def _bootstrap_staging(unit, state, planner):
+    """Reserve spare dispatch coverage where loaded robots return latest.
+
+    Initial throughput is uncertain; a reservation expires after a bounded
+    physical service interval or immediately when that unit picks up a pod.
+    """
+    if not hasattr(planner, 'bootstrap_targets'):
+        planner.bootstrap_targets = {}
+        if state.current_time_step != 0:
+            return False, None
+        sources = sorted(planner.arrival_history)
+        loaded = [other for other in state.drive_units if other.carrying]
+        empty = [other for other in state.drive_units if not other.carrying and other.capacity > 0]
+        if len(sources) < 2 or not loaded or not empty:
+            return False, None
+        stations = [node.id for node in state.nodes if node.node_type == 'station']
+        pod_map = {pod.id:pod for pod in state.active_pods}
+        assigned = set()
+        for other in empty:
+            position = other.transit_destination if other.in_transit else other.current_node
+            choices = []
+            for source in sources:
+                if source in assigned:
+                    continue
+                own = planner.distance(position, source)
+                nearest = min((planner.distance(source, station) for station in stations), default=_INF)
+                if own == _INF or nearest == _INF:
+                    continue
+                alternatives = []
+                for busy in loaded:
+                    start = busy.transit_destination if busy.in_transit else busy.current_node
+                    carried = [pod_map[p] for p in busy.carrying if p in pod_map]
+                    dest = planner.delivery_target(start, carried, state.current_time_step)
+                    if dest is not None:
+                        remaining = max(0, math.ceil(busy.transit_remaining_time)) if busy.in_transit else 0
+                        alternatives.append(remaining + planner.distance(start, dest) + planner.distance(dest, source))
+                if not alternatives:
+                    continue
+                waiting = sum(p.carried_by is None and p.current_node == source for p in state.active_pods)
+                metric = min(alternatives) - own + _WAITING_WEIGHT * waiting
+                choices.append((metric, -own, source, nearest))
+            if choices:
+                _, _, source, nearest = max(choices)
+                assigned.add(source)
+                planner.bootstrap_targets[other.id] = (source, min(16, max(2, math.ceil(nearest * _HOLD_SCALE))))
+    item = planner.bootstrap_targets.get(unit.id)
+    if item is None:
+        return False, None
+    source, expires = item
+    if unit.carrying or state.current_time_step >= expires:
+        del planner.bootstrap_targets[unit.id]
+        return False, None
+    edge_release, node_release = planner.occupancy(state)
+    return True, planner.route(unit, source, edge_release, node_release)
+
